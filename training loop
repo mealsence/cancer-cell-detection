@@ -1,0 +1,506 @@
+import os
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+import pandas as pd
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+# Simple IoU calculation function
+def calculate_iou(box1, box2):
+    """Calculate IoU between two boxes [x_min, y_min, x_max, y_max]"""
+    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
+    if x2 <= x1 or y2 <= y1: return 0
+    intersection = (x2 - x1) * (y2 - y1)
+    union = (box1[2] - box1[0]) * (box1[3] - box1[1]) + (box2[2] - box2[0]) * (box2[3] - box2[1]) - intersection
+    return intersection / union if union > 0 else 0
+
+# Simple metrics calculation
+def calculate_metrics(pred_boxes, pred_scores, gt_boxes, iou_thresh=0.5, score_thresh=0.5):
+    """Calculate precision, recall, F1 with IoU matching"""
+    filtered_preds = [(box, score) for box, score in zip(pred_boxes, pred_scores) if score > score_thresh]
+    if not filtered_preds: return {'precision': 0, 'recall': 0, 'f1': 0, 'tp': 0, 'fp': 0, 'fn': len(gt_boxes)}
+
+    pred_boxes_filtered = [box for box, _ in filtered_preds]
+    gt_matched = [False] * len(gt_boxes)
+    tp = 0
+
+    for pred_box in pred_boxes_filtered:
+        best_iou, best_idx = 0, -1
+        for j, gt_box in enumerate(gt_boxes):
+            if not gt_matched[j]:
+                iou = calculate_iou(pred_box, [gt_box[0] - gt_box[2]/2, gt_box[1] - gt_box[3]/2,
+                                               gt_box[0] + gt_box[2]/2, gt_box[1] + gt_box[3]/2])
+                if iou > best_iou and iou >= iou_thresh:
+                    best_iou, best_idx = iou, j
+        if best_idx != -1:
+            gt_matched[best_idx] = True
+            tp += 1
+
+    fp = len(pred_boxes_filtered) - tp
+    fn = len(gt_boxes) - tp
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
+    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
+
+    return {'precision': precision, 'recall': recall, 'f1': f1, 'tp': tp, 'fp': fp, 'fn': fn}
+
+class CellDataset(Dataset):
+    def __init__(self, patch_size=224, max_patches=200):  # Reduced from 1000 to 200
+        self.patch_size = patch_size
+        self.stride = patch_size // 2
+        self.max_patches = max_patches
+
+        # Just store file paths, don't load everything into memory
+        self.patch_info = []  # List of (image_path, csv_path, patch_coords)
+
+        image_dir = "images"
+        label_dir = "csv"
+
+        image_files = [f for f in os.listdir(image_dir) if f.endswith(".png")]
+        csv_files = [f for f in os.listdir(label_dir) if f.endswith(".csv")]
+        csv_lookup = {f[:-4]: f for f in csv_files}
+
+        # Calculate patch coordinates for each image (limited)
+        for img_file in image_files:
+            if img_file in csv_lookup and len(self.patch_info) < max_patches:
+                image_path = os.path.join(image_dir, img_file)
+                csv_path = os.path.join(label_dir, csv_lookup[img_file])
+
+                # Get image dimensions without loading full image
+                with Image.open(image_path) as img:
+                    W, H = img.size
+
+                # Calculate patches with larger stride to reduce count
+                stride = patch_size  # Use full patch size as stride (no overlap)
+                for y in range(0, H - patch_size + 1, stride):
+                    for x in range(0, W - patch_size + 1, stride):
+                        if len(self.patch_info) < max_patches:
+                            self.patch_info.append((image_path, csv_path, (x, y)))
+                        else:
+                            break
+                    if len(self.patch_info) >= max_patches:
+                        break
+
+        print(f"Total patches: {len(self.patch_info)} (limited to {max_patches})")
+
+    def __len__(self):
+        return len(self.patch_info)
+
+    def __getitem__(self, idx):
+        image_path, csv_path, (patch_x, patch_y) = self.patch_info[idx]
+
+        # Load image and extract patch
+        image = np.array(Image.open(image_path).convert("RGB"))
+        patch = image[patch_y:patch_y+self.patch_size, patch_x:patch_x+self.patch_size]
+
+        # Load CSV and get boxes for this patch
+        df = pd.read_csv(csv_path)
+        patch_boxes = []
+
+        for _, row in df.iterrows():
+            cx, cy = row['Centroid X pixel'], row['Centroid Y pixel']
+            w, h = row['max caliper pixel'], row['min caliper pixel']
+
+            # Box coordinates
+            x_min, y_min = cx - w/2, cy - h/2
+            x_max, y_max = cx + w/2, cy + h/2
+
+            # Check if box overlaps with patch
+            if (x_max > patch_x and x_min < patch_x + self.patch_size and
+                y_max > patch_y and y_min < patch_y + self.patch_size):
+
+                # Convert to patch coordinates
+                rel_x_min = max(0, x_min - patch_x)
+                rel_y_min = max(0, y_min - patch_y)
+                rel_x_max = min(self.patch_size, x_max - patch_x)
+                rel_y_max = min(self.patch_size, y_max - patch_y)
+
+                patch_boxes.append([rel_x_min, rel_y_min, rel_x_max, rel_y_max])
+
+        # Convert to tensors
+        patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
+
+        if patch_boxes:
+            boxes = torch.tensor(patch_boxes, dtype=torch.float32)
+            labels = torch.ones(len(patch_boxes), dtype=torch.int64)
+            area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+            area = torch.zeros((0,), dtype=torch.float32)
+
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "image_id": torch.tensor([idx]),
+            "area": area,
+            "iscrowd": torch.zeros(len(boxes), dtype=torch.int64)
+        }
+
+        return patch_tensor, target
+
+# Create dataset and data loaders with reduced patches
+dataset = CellDataset(patch_size=224, max_patches=200)  # Reduced limit
+
+from torch.utils.data import random_split, DataLoader
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+train_size = int(0.8 * len(dataset))
+val_size = len(dataset) - train_size
+train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+
+# Reduced batch size and reverted learning rate
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn, num_workers=2)
+val_loader = DataLoader(val_dataset, batch_size=2, shuffle=False, collate_fn=collate_fn, num_workers=2)
+
+# Model setup
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 2)  # background + cell
+
+model.to(device)
+
+# Option to load pre-existing model before training
+def load_pretrained_model(model_path='best_model.pth'):
+    """Load a pre-existing model before training"""
+    if os.path.exists(model_path):
+        print(f"Loading pre-existing model from {model_path}...")
+        checkpoint = torch.load(model_path, map_location=device)
+
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✓ Pre-existing model loaded! (Epoch {checkpoint.get('epoch', 'N/A')}, "
+                  f"Loss: {checkpoint.get('loss', 'N/A'):.4f})")
+            return checkpoint.get('epoch', 0), checkpoint.get('loss', float('inf'))
+        else:
+            # Legacy format
+            model.load_state_dict(checkpoint)
+            print("✓ Pre-existing model loaded successfully!")
+            return 0, float('inf')
+    else:
+        print(f"No pre-existing model found at {model_path}, starting fresh training.")
+        return 0, float('inf')
+
+# Load pre-existing model if available
+start_epoch, best_loss = load_pretrained_model()
+if start_epoch > 0:
+    print(f"Resuming training from epoch {start_epoch + 1}")
+else:
+    best_loss = float('inf')
+
+# Reverted to original learning rate
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+# Shorter training with manageable dataset size
+n_epochs = 10  # Increased epochs to 10
+patience = 4  # Moderate patience
+patience_counter = 0
+train_losses = []
+
+# Enable optimizations
+torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
+torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster training
+torch.backends.cudnn.allow_tf32 = True
+
+# Fixed mixed precision training for speed
+scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None  # Fixed deprecated API
+use_amp = device.type == 'cuda'
+
+print("Starting optimized training...")
+print(f"Using mixed precision: {use_amp}")
+print(f"CUDA optimizations enabled: {torch.backends.cudnn.benchmark}")
+
+for epoch in range(1, n_epochs + 1):
+    model.train()
+    total_loss = 0
+    batch_count = 0
+
+    # More efficient progress tracking
+    pbar = tqdm(train_loader, desc=f'Epoch {epoch}/{n_epochs}',
+                leave=False, dynamic_ncols=True, miniters=1)
+
+    for batch_idx, (images, targets) in enumerate(pbar):
+        # Efficient data transfer with non_blocking
+        images = [img.to(device, non_blocking=True) for img in images]
+        targets = [{k: v.to(device, non_blocking=True) for k, v in t.items()} for t in targets]
+
+        # Fixed mixed precision forward pass
+        if use_amp:
+            with torch.amp.autocast('cuda'):  # Fixed deprecated API
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+
+            # Scaled backward pass
+            scaler.scale(losses).backward()
+
+            # Gradient clipping for stability
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            # Optimizer step with scaling
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad(set_to_none=True)  # More efficient than zero_grad()
+        else:
+            # Standard training for CPU
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+
+            losses.backward()
+
+            # Gradient clipping for stability
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Accumulate loss
+        loss_value = losses.item()
+        total_loss += loss_value
+        batch_count += 1
+
+        # Update progress bar less frequently for speed
+        if batch_idx % 5 == 0:
+            pbar.set_postfix({
+                'Loss': f'{loss_value:.4f}',
+                'Avg': f'{total_loss/batch_count:.4f}'
+            })
+
+    pbar.close()
+
+    # Calculate metrics
+    avg_loss = total_loss / batch_count
+    train_losses.append(avg_loss)
+    current_lr = optimizer.param_groups[0]['lr']
+
+    # Enhanced logging
+    print(f'Epoch {epoch}/{n_epochs} | Loss: {avg_loss:.4f} | LR: {current_lr:.6f} | '
+          f'Batches: {batch_count}')
+
+    # Learning rate scheduling
+    scheduler.step(avg_loss)
+
+    # Efficient model saving and early stopping
+    if avg_loss < best_loss:
+        best_loss = avg_loss
+        patience_counter = 0
+
+        # Save model state efficiently
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'epoch': epoch,
+            'loss': best_loss,
+            'scaler_state_dict': scaler.state_dict() if scaler else None
+        }, 'best_model.pth')
+
+        print(f'✓ New best model saved! Loss: {best_loss:.4f}')
+    else:
+        patience_counter += 1
+        print(f'No improvement. Patience: {patience_counter}/{patience}')
+
+        if patience_counter >= patience:
+            print(f'Early stopping triggered after {epoch} epochs')
+            break
+
+    # Clear cache periodically to prevent memory issues
+    if device.type == 'cuda':
+        torch.cuda.empty_cache()
+
+print("Training completed!")
+
+# Load best model for prediction
+def load_best_model():
+    """Load the best saved model"""
+    if os.path.exists('best_model.pth'):
+        print("Loading best model...")
+        checkpoint = torch.load('best_model.pth', map_location=device)
+
+        # Handle both old and new checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✓ Best model loaded! (Epoch {checkpoint.get('epoch', 'N/A')}, "
+                  f"Loss: {checkpoint.get('loss', 'N/A'):.4f})")
+        else:
+            # Legacy format
+            model.load_state_dict(checkpoint)
+            print("✓ Best model loaded successfully!")
+    else:
+        print("No saved model found, using current model state.")
+    return model
+
+# Visualization function (with bounding boxes instead of dots)
+def visualize_predictions(image_path, pred_boxes, pred_scores, gt_csv_path=None,
+                         score_threshold=0.5, save_path=None, show_plot=True):
+    """
+    Visualize predictions on an image and calculate IoU metrics
+
+    Args:
+        image_path: Path to the image file
+        pred_boxes: List of predicted bounding boxes
+        pred_scores: List of prediction scores
+        gt_csv_path: Path to ground truth CSV file (optional)
+        score_threshold: Minimum score for displaying predictions
+        save_path: Path to save the visualization (optional)
+        show_plot: Whether to display the plot
+    """
+    # Load image
+    image = np.array(Image.open(image_path).convert("RGB"))
+
+    # Create figure and axis
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    ax.imshow(image)
+    ax.set_title(f'Cell Detection Results\nImage: {os.path.basename(image_path)}', fontsize=14)
+
+    # Plot predicted boxes
+    pred_count = 0
+    for box, score in zip(pred_boxes, pred_scores):
+        if score > score_threshold:
+            x_min, y_min, x_max, y_max = box
+
+            # Create bounding box rectangle (red)
+            width = x_max - x_min
+            height = y_max - y_min
+            rect = patches.Rectangle((x_min, y_min), width, height,
+                                   linewidth=2, edgecolor='red', facecolor='none', alpha=0.8)
+            ax.add_patch(rect)
+
+            # Add score text
+            ax.text(x_min, y_min - 2, f'{score:.2f}',
+                   color='red', fontsize=8, fontweight='bold',
+                   bbox=dict(boxstyle="round,pad=0.2", facecolor='white', alpha=0.8))
+            pred_count += 1
+
+    # Calculate IoU metrics if ground truth is available
+    metrics_text = f'Detected: {pred_count} cells (score > {score_threshold})'
+
+    if gt_csv_path and os.path.exists(gt_csv_path):
+        # Load ground truth (simplified)
+        gt_df = pd.read_csv(gt_csv_path)
+        gt_boxes = [[row['Centroid X pixel'], row['Centroid Y pixel'],
+                    row['max caliper pixel'], row['min caliper pixel']]
+                   for _, row in gt_df.iterrows()]
+
+        # Calculate metrics (simplified)
+        metrics = calculate_metrics(pred_boxes, pred_scores, gt_boxes, score_thresh=score_threshold)
+
+        # Update metrics text
+        metrics_text += f'\nGround Truth: {len(gt_boxes)} cells'
+        metrics_text += f'\nPrecision: {metrics["precision"]:.3f}'
+        metrics_text += f'\nRecall: {metrics["recall"]:.3f}'
+        metrics_text += f'\nF1-Score: {metrics["f1"]:.3f}'
+        metrics_text += f'\nTP: {metrics["tp"]}, FP: {metrics["fp"]}, FN: {metrics["fn"]}'
+
+        # Print simplified metrics
+        print(f"\nMETRICS: P={metrics['precision']:.3f}, R={metrics['recall']:.3f}, F1={metrics['f1']:.3f} | TP={metrics['tp']}, FP={metrics['fp']}, FN={metrics['fn']}")
+
+    # Add legend
+    legend_elements = [patches.Rectangle((0, 0), 1, 1, linewidth=2, edgecolor='red',
+                                       facecolor='none', label=f'Predictions ({pred_count})')]
+    ax.legend(handles=legend_elements, loc='upper right')
+
+    # Add detection summary
+    ax.text(0.02, 0.98, metrics_text, transform=ax.transAxes, fontsize=10,
+            verticalalignment='top', bbox=dict(boxstyle="round,pad=0.5",
+                                             facecolor='white', alpha=0.8))
+
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    ax.grid(True, alpha=0.3)
+
+    # Save if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        print(f"Visualization saved to: {save_path}")
+
+    # Show plot
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+# Simple prediction function
+def predict_on_image(image_path, csv_path=None, visualize=True, save_viz=None):
+    model.eval()
+
+    # Load and process image
+    image = np.array(Image.open(image_path).convert("RGB"))
+    H, W = image.shape[:2]
+
+    all_boxes = []
+    all_scores = []
+
+    print(f"Processing image: {os.path.basename(image_path)} ({W}x{H})")
+
+    # Process in patches
+    patch_count = 0
+    for y in range(0, H - 224 + 1, 112):
+        for x in range(0, W - 224 + 1, 112):
+            patch = image[y:y+224, x:x+224]
+            patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
+            patch_tensor = patch_tensor.unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                pred = model(patch_tensor)[0]
+
+            # Convert back to full image coordinates
+            for box, score in zip(pred['boxes'], pred['scores']):
+                if score > 0.5:
+                    box = box.cpu().numpy()
+                    box[0] += x  # x_min
+                    box[1] += y  # y_min
+                    box[2] += x  # x_max
+                    box[3] += y  # y_max
+                    all_boxes.append(box)
+                    all_scores.append(score.cpu().numpy())
+
+            patch_count += 1
+
+    print(f"Processed {patch_count} patches")
+    print(f"Detected {len(all_boxes)} cells")
+
+    # Visualize results if requested
+    if visualize:
+        visualize_predictions(image_path, all_boxes, all_scores, csv_path,
+                            save_path=save_viz, show_plot=True)
+
+    return all_boxes, all_scores
+
+# Load best model
+model = load_best_model()
+
+# Test on random image from dataset with visualization
+import random
+
+if len(dataset) > 0:
+    # Select random image from dataset
+    random_idx = random.randint(0, len(dataset) - 1)
+    random_image_path = dataset.patch_info[random_idx][0]
+    random_csv_path = dataset.patch_info[random_idx][1]
+
+    print("\n" + "="*50)
+    print(f"TESTING ON RANDOM IMAGE (Index: {random_idx})")
+    print("="*50)
+
+    boxes, scores = predict_on_image(random_image_path, random_csv_path,
+                                   visualize=True,
+                                   save_viz='prediction_result.png')
+
+    print(f"\nPrediction completed!")
+    print(f"Results saved to: prediction_result.png")
+else:
+    print("No dataset available for testing.")
