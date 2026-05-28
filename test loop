@@ -1,0 +1,382 @@
+import os
+
+# Remove the saved best model
+model_path = 'best_model.pth'
+
+if os.path.exists(model_path):
+    os.remove(model_path)
+    print(f"✓ Removed {model_path}")
+else:
+    print(f"File {model_path} not found")
+
+# Optional: Also check for and remove any other model files
+other_model_files = ['model.pth', 'checkpoint.pth', 'latest_model.pth']
+for file in other_model_files:
+    if os.path.exists(file):
+        os.remove(file)
+        print(f"✓ Removed {file}")
+
+
+#Test
+import os
+import torch
+from torch.utils.data import Dataset
+from torchvision import transforms
+import pandas as pd
+from PIL import Image
+import numpy as np
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
+
+class CellDataset(Dataset):
+    def __init__(self, patch_size=224, max_patches=200):  # Reduced from 1000 to 200
+        self.patch_size = patch_size
+        self.stride = patch_size // 2
+        self.max_patches = max_patches
+
+        # Just store file paths, don't load everything into memory
+        self.patch_info = []  # List of (image_path, csv_path, patch_coords)
+
+        image_dir = "images_test"
+        label_dir = "csv_test"
+
+        image_files = [f for f in os.listdir(image_dir) if f.endswith(".png")]
+        csv_files = [f for f in os.listdir(label_dir) if f.endswith(".csv")]
+        csv_lookup = {f[:-4]: f for f in csv_files}
+
+        # Calculate patch coordinates for each image (limited)
+        for img_file in image_files:
+            if img_file in csv_lookup and len(self.patch_info) < max_patches:
+                image_path = os.path.join(image_dir, img_file)
+                csv_path = os.path.join(label_dir, csv_lookup[img_file])
+
+                # Get image dimensions without loading full image
+                with Image.open(image_path) as img:
+                    W, H = img.size
+
+                # Calculate patches with larger stride to reduce count
+                stride = patch_size  # Use full patch size as stride (no overlap)
+                for y in range(0, H - patch_size + 1, stride):
+                    for x in range(0, W - patch_size + 1, stride):
+                        if len(self.patch_info) < max_patches:
+                            self.patch_info.append((image_path, csv_path, (x, y)))
+                        else:
+                            break
+                    if len(self.patch_info) >= max_patches:
+                        break
+
+        print(f"Total patches: {len(self.patch_info)} (limited to {max_patches})")
+
+    def __len__(self):
+        return len(self.patch_info)
+
+    def __getitem__(self, idx):
+        image_path, csv_path, (patch_x, patch_y) = self.patch_info[idx]
+
+        # Load image and extract patch
+        image = np.array(Image.open(image_path).convert("RGB"))
+        patch = image[patch_y:patch_y+self.patch_size, patch_x:patch_x+self.patch_size]
+
+        # Load CSV and get boxes for this patch
+        df = pd.read_csv(csv_path)
+        patch_boxes = []
+
+        for _, row in df.iterrows():
+            cx, cy = row['Centroid X pixel'], row['Centroid Y pixel']
+            w, h = row['max caliper pixel'], row['min caliper pixel']
+
+            # Box coordinates
+            x_min, y_min = cx - w/2, cy - h/2
+            x_max, y_max = cx + w/2, cy + h/2
+
+            # Check if box overlaps with patch
+            if (x_max > patch_x and x_min < patch_x + self.patch_size and
+                y_max > patch_y and y_min < patch_y + self.patch_size):
+
+                # Convert to patch coordinates
+                rel_x_min = max(0, x_min - patch_x)
+                rel_y_min = max(0, y_min - patch_y)
+                rel_x_max = min(self.patch_size, x_max - patch_x)
+                rel_y_max = min(self.patch_size, y_max - patch_y)
+
+                patch_boxes.append([rel_x_min, rel_y_min, rel_x_max, rel_y_max])
+
+        # Convert to tensors
+        patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
+
+        if patch_boxes:
+            boxes = torch.tensor(patch_boxes, dtype=torch.float32)
+            labels = torch.ones(len(patch_boxes), dtype=torch.int64)
+            area = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+            area = torch.zeros((0,), dtype=torch.float32)
+
+        target = {
+            "boxes": boxes,
+            "labels": labels,
+            "image_id": torch.tensor([idx]),
+            "area": area,
+            "iscrowd": torch.zeros(len(boxes), dtype=torch.int64)
+        }
+
+        return patch_tensor, target
+
+# Create dataset and data loaders with reduced patches
+dataset = CellDataset(patch_size=224, max_patches=200)  # Reduced limit
+
+from torch.utils.data import random_split, DataLoader
+
+def collate_fn(batch):
+    return tuple(zip(*batch))
+
+train_size = 1
+
+train_dataset = dataset
+
+# Reduced batch size and reverted learning rate
+train_loader = DataLoader(train_dataset, batch_size=2, shuffle=True, collate_fn=collate_fn, num_workers=2)
+
+# Model setup
+from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+
+model = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT)
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 2)  # background + cell
+
+model.to(device)
+
+# Option to load pre-existing model before training
+def load_pretrained_model(model_path='best_model.pth'):
+    """Load a pre-existing model before training"""
+    if os.path.exists(model_path):
+        print(f"Loading pre-existing model from {model_path}...")
+        checkpoint = torch.load(model_path, map_location=device)
+
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✓ Pre-existing model loaded! (Epoch {checkpoint.get('epoch', 'N/A')}, "
+                  f"Loss: {checkpoint.get('loss', 'N/A'):.4f})")
+            return checkpoint.get('epoch', 0), checkpoint.get('loss', float('inf'))
+        else:
+            # Legacy format
+            model.load_state_dict(checkpoint)
+            print("✓ Pre-existing model loaded successfully!")
+            return 0, float('inf')
+    else:
+        print(f"No pre-existing model found at {model_path}, starting fresh training.")
+        return 0, float('inf')
+
+# Load pre-existing model if available
+start_epoch, best_loss = load_pretrained_model()
+if start_epoch > 0:
+    print(f"Resuming training from epoch {start_epoch + 1}")
+else:
+    best_loss = float('inf')
+
+# Reverted to original learning rate
+optimizer = torch.optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.0001)
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
+
+# Shorter training with manageable dataset size
+n_epochs = 10  # Increased epochs to 10
+patience = 2  # Moderate patience
+patience_counter = 0
+train_losses = []
+
+# Enable optimizations
+torch.backends.cudnn.benchmark = True  # Optimize for fixed input sizes
+torch.backends.cuda.matmul.allow_tf32 = True  # Use TF32 for faster training
+torch.backends.cudnn.allow_tf32 = True
+
+# Fixed mixed precision training for speed
+scaler = torch.amp.GradScaler('cuda') if device.type == 'cuda' else None  # Fixed deprecated API
+use_amp = device.type == 'cuda'
+
+print("Starting optimized training...")
+print(f"Using mixed precision: {use_amp}")
+print(f"CUDA optimizations enabled: {torch.backends.cudnn.benchmark}")
+
+
+# Load best model for prediction
+def load_best_model():
+    """Load the best saved model"""
+    if os.path.exists('best_model.pth'):
+        print("Loading best model...")
+        checkpoint = torch.load('best_model.pth', map_location=device)
+
+        # Handle both old and new checkpoint formats
+        if 'model_state_dict' in checkpoint:
+            model.load_state_dict(checkpoint['model_state_dict'])
+            print(f"✓ Best model loaded! (Epoch {checkpoint.get('epoch', 'N/A')}, "
+                  f"Loss: {checkpoint.get('loss', 'N/A'):.4f})")
+        else:
+            # Legacy format
+            model.load_state_dict(checkpoint)
+            print("✓ Best model loaded successfully!")
+    else:
+        print("No saved model found, using current model state.")
+    return model
+
+# MODIFIED Visualization function - GREEN GROUND TRUTH DOTS REMOVED
+def visualize_predictions(image_path, pred_boxes, pred_scores, gt_csv_path=None,
+                         score_threshold=0.5, save_path=None, show_plot=True):
+    """
+    Visualize predictions on an image (ground truth dots removed)
+
+    Args:
+        image_path: Path to the image file
+        pred_boxes: List of predicted bounding boxes
+        pred_scores: List of prediction scores
+        gt_csv_path: Path to ground truth CSV file (optional, for count only)
+        score_threshold: Minimum score for displaying predictions
+        save_path: Path to save the visualization (optional)
+        show_plot: Whether to display the plot
+    """
+    # Load image
+    image = np.array(Image.open(image_path).convert("RGB"))
+
+    # Create figure and axis
+    fig, ax = plt.subplots(1, 1, figsize=(12, 8))
+    ax.imshow(image)
+    ax.set_title(f'Cell Detection Results\nImage: {os.path.basename(image_path)}', fontsize=14)
+
+    # Plot predicted boxes ONLY (red dots)
+    pred_count = 0
+    for box, score in zip(pred_boxes, pred_scores):
+        if score > score_threshold:
+            x_min, y_min, x_max, y_max = box
+            center_x = (x_min + x_max) / 2
+            center_y = (y_min + y_max) / 2
+
+            # Create dot for prediction (red)
+            ax.plot(center_x, center_y, 'ro', markersize=8, alpha=0.8)
+            pred_count += 1
+
+    # Count ground truth for display purposes only (NO PLOTTING OF GREEN DOTS)
+    gt_count = 0
+    if gt_csv_path and os.path.exists(gt_csv_path):
+        gt_df = pd.read_csv(gt_csv_path)
+        gt_count = len(gt_df)
+        # NOTE: Ground truth dots are NOT plotted anymore
+
+    # Add legend (only for predictions now)
+    legend_elements = []
+    if pred_count > 0:
+        legend_elements.append(plt.Line2D([0], [0], marker='o', color='w',
+                                        markerfacecolor='red', markersize=8,
+                                        label=f'Predictions ({pred_count})'))
+
+    if legend_elements:
+        ax.legend(handles=legend_elements, loc='upper right')
+
+    # Add detection summary (still shows ground truth count for reference)
+    summary_text = f'Detected: {pred_count} cells (score > {score_threshold})'
+    if gt_count > 0:
+        summary_text += f'\nGround Truth: {gt_count} cells (not shown)'
+
+    ax.text(0.02, 0.98, summary_text, transform=ax.transAxes, fontsize=12,
+            verticalalignment='top', bbox=dict(boxstyle="round,pad=0.5",
+                                             facecolor='white', alpha=0.8))
+
+    ax.set_xlabel('X (pixels)')
+    ax.set_ylabel('Y (pixels)')
+    ax.grid(True, alpha=0.3)
+
+    # Save if requested
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+        print(f"Visualization saved to: {save_path}")
+
+    # Show plot
+    if show_plot:
+        plt.tight_layout()
+        plt.show()
+    else:
+        plt.close()
+
+# Simple prediction function
+def predict_on_image(image_path, csv_path=None, visualize=True, save_viz=None):
+    model.eval()
+
+    # Load and process image
+    image = np.array(Image.open(image_path).convert("RGB"))
+    H, W = image.shape[:2]
+
+    all_boxes = []
+    all_scores = []
+
+    print(f"Processing image: {os.path.basename(image_path)} ({W}x{H})")
+
+    # Process in patches
+    patch_count = 0
+    for y in range(0, H - 224 + 1, 112):
+        for x in range(0, W - 224 + 1, 112):
+            patch = image[y:y+224, x:x+224]
+            patch_tensor = torch.from_numpy(patch).permute(2, 0, 1).float() / 255.0
+            patch_tensor = patch_tensor.unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                pred = model(patch_tensor)[0]
+
+            # Convert back to full image coordinates
+            for box, score in zip(pred['boxes'], pred['scores']):
+                if score > 0.5:
+                    box = box.cpu().numpy()
+                    box[0] += x  # x_min
+                    box[1] += y  # y_min
+                    box[2] += x  # x_max
+                    box[3] += y  # y_max
+                    all_boxes.append(box)
+                    all_scores.append(score.cpu().numpy())
+
+            patch_count += 1
+
+    print(f"Processed {patch_count} patches")
+    print(f"Detected {len(all_boxes)} cells")
+
+    if csv_path and os.path.exists(csv_path):
+        gt_df = pd.read_csv(csv_path)
+        print(f"Ground truth: {len(gt_df)} cells")
+
+    # Visualize results if requested (NO GREEN DOTS)
+    if visualize:
+        visualize_predictions(image_path, all_boxes, all_scores, csv_path,
+                            save_path=save_viz, show_plot=True)
+
+    return all_boxes, all_scores
+
+# Load best model
+model = load_best_model()
+
+# Test on random image from dataset with visualization
+import random
+
+count = 0
+if len(train_dataset) > 0:
+  for count in range(0, len(train_dataset)):
+    test_image_path = dataset.patch_info[count][0]
+    test_csv_path = dataset.patch_info[count][1]
+
+    print("\n" + "="*50)
+    print(f"TESTING ON IMAGE (Index: {count})")
+    print("="*50)
+
+    save_path = f"prediction_result for{test_image_path}"
+    save_path += str(count)
+    save_path += ".png"
+
+    boxes, scores = predict_on_image(test_image_path, test_csv_path,
+                                   visualize=True,
+                                   save_viz=save_path)
+
+    print(f"\nPrediction completed!")
+    print(f"Results saved to: prediction_result.png")
+else:
+    print("No dataset available for testing.")
